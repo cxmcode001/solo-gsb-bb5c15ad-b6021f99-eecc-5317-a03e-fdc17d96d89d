@@ -10,7 +10,13 @@ from typing import Any
 from fastapi import FastAPI
 from pydantic import BaseModel, ConfigDict, Field, StrictInt
 
-from .anonymizer import apply_levels, prepare_hierarchies, solve_levels, unprocessable
+from .anonymizer import (
+    apply_levels,
+    prepare_hierarchies,
+    prepare_sensitive,
+    solve_levels,
+    unprocessable,
+)
 
 API_PREFIX = "/api/v1"
 
@@ -18,7 +24,8 @@ app = FastAPI(
     title="野外观测记录匿名化 API",
     description=(
         "对自然保护站公开野外观测记录进行统一层级泛化，"
-        "使发布后的每种字段值组合至少出现 k 次。"
+        "使发布后的每种字段值组合至少出现 k 次；"
+        "可选地要求每个分组同时包含至少 l 种不同敏感值。"
     ),
     version="1.0.0",
 )
@@ -33,6 +40,13 @@ class AnonymizeRequest(BaseModel):
     # 每个字段：原值 -> 从原值（含）到统一通配符（含）的层级路径，至多 4 级。
     fields: dict[str, dict[str, list[str]]] = Field(
         ..., description="最多 3 个待匿名字段的泛化层级映射"
+    )
+    # 可选的敏感属性多样性约束：两项必须同时提供或同时省略。
+    sensitive_field: str | None = Field(
+        default=None, description="敏感属性字段名（不得与待匿名字段重合）"
+    )
+    l: StrictInt | None = Field(
+        default=None, description="每个发布分组至少包含的不同敏感值种数"
     )
 
     model_config = ConfigDict(extra="forbid")
@@ -74,7 +88,11 @@ def health() -> dict[str, str]:
 
 @app.post(f"{API_PREFIX}/anonymize", response_model=AnonymizeResponse)
 def anonymize(request: AnonymizeRequest) -> AnonymizeResponse:
-    """对记录执行统一层级泛化，返回可公开发布的匿名化结果。"""
+    """对记录执行统一层级泛化，返回可公开发布的匿名化结果。
+
+    同时提供 ``sensitive_field`` 与 ``l`` 时，每个发布分组还需包含
+    至少 l 种不同的敏感值（l-多样性）。
+    """
     if request.k < 1:
         raise unprocessable("k 必须是正整数（>= 1）")
 
@@ -85,7 +103,12 @@ def anonymize(request: AnonymizeRequest) -> AnonymizeResponse:
         )
 
     names, hierarchies = prepare_hierarchies(request.records, request.fields)
-    combo, _ = solve_levels(request.records, names, hierarchies, request.k)
+    sensitive_values = prepare_sensitive(
+        request.records, request.fields, request.sensitive_field, request.l
+    )
+    combo, _ = solve_levels(
+        request.records, names, hierarchies, request.k, sensitive_values, request.l
+    )
     selected_levels = dict(zip(names, combo))
     generalized_records, groups = apply_levels(
         request.records, names, hierarchies, combo

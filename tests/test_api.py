@@ -338,3 +338,156 @@ def test_no_records_written_to_disk(tmp_path, monkeypatch):
     response = client.post("/api/v1/anonymize", json=payload(k=3))
     assert response.status_code == 200
     assert list(tmp_path.rglob("*")) == []
+
+
+# ---------------------------------------------------------------- l-多样性
+
+# 每条记录的健康状况（敏感属性）：神农架组 2 种、卧龙组 3 种、全部共 5 种。
+HEALTH_VALUES = ["健康", "健康", "受伤", "受伤", "患病", "康复", "体弱", "体弱"]
+
+
+def make_health_records(values=None) -> list[dict[str, str]]:
+    values = HEALTH_VALUES if values is None else values
+    return [dict(record, health=v) for record, v in zip(RECORDS, values)]
+
+
+def sensitive_payload(k=3, l=3, records=None, sensitive_field="health") -> dict:
+    return {
+        "k": k,
+        "records": make_health_records() if records is None else records,
+        "fields": FIELDS,
+        "sensitive_field": sensitive_field,
+        "l": l,
+    }
+
+
+def test_l_diversity_changes_selected_levels():
+    # k=3 时最小方案本为 (reserve=1, species=2)，但“神农架|哺乳动物”组只有
+    # 2 种健康状况，不满足 l=3；需退到 (reserve=3, species=2) 的单组方案。
+    response = client.post("/api/v1/anonymize", json=sensitive_payload(k=3, l=3))
+    assert response.status_code == 200
+    body = response.json()
+    assert body["selected_levels"] == {"reserve": 3, "species": 2}
+    assert len(body["groups"]) == 1
+    assert body["groups"][0]["values"] == {"reserve": "*", "species": "哺乳动物"}
+    assert body["groups"][0]["count"] == 8
+
+
+def test_l_diversity_non_binding_keeps_existing_choice():
+    # l=2 时 k-匿名最小方案的每个组都已有 >= 2 种敏感值，选层结果不变。
+    response = client.post("/api/v1/anonymize", json=sensitive_payload(k=3, l=2))
+    assert response.status_code == 200
+    body = response.json()
+    assert body["selected_levels"] == {"reserve": 1, "species": 2}
+    counts = sorted(group["count"] for group in body["groups"])
+    assert counts == [4, 4]
+    # 敏感字段不是匿名字段，原样保留在泛化记录中。
+    assert body["generalized_records"][0]["health"] == "健康"
+
+
+def test_l_diversity_tie_break_lexicographic():
+    # 在字典序裁决用例上叠加敏感值：4 条记录敏感值两两不同，l=2 时
+    # (area=1, loc=2) 与 (area=2, loc=1) 同为和 3 且均满足两项约束，
+    # 仍按字段名排序后的字典序取 (1, 2)。
+    records = [
+        {"loc": "a1", "area": "b1", "s": "s1"},
+        {"loc": "a2", "area": "b3", "s": "s2"},
+        {"loc": "a3", "area": "b2", "s": "s3"},
+        {"loc": "a4", "area": "b4", "s": "s4"},
+    ]
+    fields = {
+        "area": {
+            "b1": ["b1", "B", "*"],
+            "b2": ["b2", "B", "*"],
+            "b3": ["b3", "C", "*"],
+            "b4": ["b4", "C", "*"],
+        },
+        "loc": {
+            "a1": ["a1", "X", "*"],
+            "a2": ["a2", "X", "*"],
+            "a3": ["a3", "Y", "*"],
+            "a4": ["a4", "Y", "*"],
+        },
+    }
+    response = client.post(
+        "/api/v1/anonymize",
+        json={
+            "k": 2,
+            "records": records,
+            "fields": fields,
+            "sensitive_field": "s",
+            "l": 2,
+        },
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["selected_levels"] == {"area": 1, "loc": 2}
+    for group in body["groups"]:
+        assert group["count"] >= 2
+
+
+def test_422_when_l_diversity_infeasible():
+    # 全部记录只有 5 种健康状况，任何组合都不可能达到 l=6。
+    response = client.post("/api/v1/anonymize", json=sensitive_payload(k=2, l=6))
+    assert response.status_code == 422
+    assert "泛化方案" in response.json()["detail"]
+
+
+def test_422_when_only_one_of_sensitive_params():
+    base = sensitive_payload(k=3, l=3)
+
+    only_field = {key: value for key, value in base.items() if key != "l"}
+    response = client.post("/api/v1/anonymize", json=only_field)
+    assert response.status_code == 422
+    assert "同时" in response.json()["detail"]
+
+    only_l = {key: value for key, value in base.items() if key != "sensitive_field"}
+    response = client.post("/api/v1/anonymize", json=only_l)
+    assert response.status_code == 422
+    assert "同时" in response.json()["detail"]
+
+
+def test_422_when_sensitive_field_overlaps_fields():
+    response = client.post(
+        "/api/v1/anonymize",
+        json=sensitive_payload(k=2, l=2, sensitive_field="species"),
+    )
+    assert response.status_code == 422
+    assert "重合" in response.json()["detail"]
+
+
+def test_422_when_sensitive_value_not_non_empty_string():
+    # 某条记录缺少敏感字段。
+    records = make_health_records()
+    del records[3]["health"]
+    response = client.post(
+        "/api/v1/anonymize", json=sensitive_payload(k=2, l=2, records=records)
+    )
+    assert response.status_code == 422
+    assert "非空字符串" in response.json()["detail"]
+
+    # 敏感值为非字符串、空串、纯空白或不可哈希对象。
+    for bad in (123, "", "   ", ["健康"]):
+        records = make_health_records()
+        records[0]["health"] = bad
+        response = client.post(
+            "/api/v1/anonymize",
+            json=sensitive_payload(k=2, l=2, records=records),
+        )
+        assert response.status_code == 422
+        assert "非空字符串" in response.json()["detail"]
+
+
+def test_422_when_l_not_positive():
+    for bad_l in (0, -2):
+        response = client.post(
+            "/api/v1/anonymize", json=sensitive_payload(k=2, l=bad_l)
+        )
+        assert response.status_code == 422
+
+
+def test_422_when_l_is_bool():
+    body = sensitive_payload(k=2, l=2)
+    body["l"] = True
+    response = client.post("/api/v1/anonymize", json=body)
+    assert response.status_code == 422

@@ -1,4 +1,4 @@
-"""匿名化核心逻辑：在统一层级泛化下满足 k-匿名，最小化层级序号之和。"""
+"""匿名化核心逻辑：统一层级泛化下满足 k-匿名（可选 l-多样性），最小化层级序号之和。"""
 
 from __future__ import annotations
 
@@ -96,16 +96,53 @@ def prepare_hierarchies(
     return names, hierarchies
 
 
+def prepare_sensitive(
+    records: list[dict[str, Any]],
+    fields: dict[str, dict[str, list[str]]],
+    sensitive_field: str | None,
+    l: int | None,
+) -> list[str] | None:
+    """校验可选的敏感属性多样性约束，返回每条记录对应的敏感值列表。
+
+    ``sensitive_field`` 与 ``l`` 必须同时提供或同时省略；都省略时返回
+    ``None``，表示不启用 l-多样性约束。
+    """
+    if (sensitive_field is None) != (l is None):
+        raise unprocessable("sensitive_field 与 l 必须同时提供或同时省略")
+    if sensitive_field is None or l is None:
+        return None
+
+    if l < 1:
+        raise unprocessable("l 必须是正整数（>= 1）")
+    if sensitive_field in fields:
+        raise unprocessable(
+            f"敏感字段 {sensitive_field!r} 不得与待匿名字段重合"
+        )
+
+    values: list[str] = []
+    for record in records:
+        value = record.get(sensitive_field)
+        if not isinstance(value, str) or not value.strip():
+            raise unprocessable(
+                f"敏感字段 {sensitive_field!r} 在每条记录中的值都必须是非空字符串"
+            )
+        values.append(value)
+    return values
+
+
 def solve_levels(
     records: list[dict[str, Any]],
     names: list[str],
     hierarchies: dict[str, dict[int, dict[str, str]]],
     k: int,
+    sensitive_values: list[str] | None = None,
+    l: int | None = None,
 ) -> tuple[tuple[int, ...], list[str]]:
     """选出最优统一层级组合。
 
-    遍历所有层级组合，保留满足“每组至少 k 条”的方案；
-    先最小化层级序号之和，再按字段名排序后的层级序号字典序裁决。
+    遍历所有层级组合，保留满足“每组至少 k 条”的方案；启用 l-多样性时
+    （``sensitive_values`` 与 ``l`` 同时给出），还要求每个组内不同敏感值
+    至少 l 种。先最小化层级序号之和，再按字段名排序后的层级序号字典序裁决。
     返回 (选中层级组合, 按字段名排序后的键名列表)。
     """
     levels_range = [range(len(hierarchies[name])) for name in names]
@@ -129,6 +166,19 @@ def solve_levels(
         if smallest_group < k:
             continue
 
+        if sensitive_values is not None and l is not None:
+            diversity: dict[tuple[str, ...], set[str]] = {}
+            for signature, sensitive in zip(signatures, sensitive_values):
+                diversity.setdefault(signature, set()).add(sensitive)
+            if diversity:
+                smallest_diversity = min(
+                    len(values) for values in diversity.values()
+                )
+            else:
+                smallest_diversity = 0
+            if smallest_diversity < l:
+                continue
+
         total = sum(combo)
         if (
             best_combo is None
@@ -139,6 +189,10 @@ def solve_levels(
             best_sum = total
 
     if best_combo is None:
+        if sensitive_values is not None:
+            # 启用 l-多样性时，全通配符组合也不再必然可行
+            # （例如全部记录的不同敏感值总数小于 l）。
+            raise unprocessable("不存在同时满足 k-匿名与 l-多样性的泛化方案")
         # 结构合法时，全字段选通配符级必然可行，这里仅作防御性兜底。
         raise unprocessable("不存在满足 k-匿名的泛化方案")
 
